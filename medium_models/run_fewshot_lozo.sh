@@ -110,10 +110,9 @@ if [[ $NUM_GPU > 1 ]]; then
     # Allow multiple threads
     export OMP_NUM_THREADS=8
 
-    python -m torch.distributed.launch --nproc_per_node $NUM_GPU --master_port $PORT_ID run_lozo.py \
+    torchrun --nproc_per_node $NUM_GPU --master_port $PORT_ID run_lozo.py \
         $ALL_ARGS_TOGETHER
 else
-    python run_lozo.py \
-        $ALL_ARGS_TOGETHER
+    torchrun --nproc_per_node $NUM_GPU run_lozo.py $ALL_ARGS_TOGETHER
 fi
 

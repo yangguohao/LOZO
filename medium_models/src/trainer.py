@@ -41,7 +41,7 @@ import math
 import time
 
 import transformers
-from transformers.file_utils import is_datasets_available, is_in_notebook, is_torch_tpu_available
+from transformers.file_utils import is_datasets_available, is_in_notebook
 from transformers.integrations import (
     is_comet_available,
     is_optuna_available,
@@ -63,7 +63,7 @@ from transformers.utils import logging
 from transformers.trainer_utils import TrainOutput
 
 from tqdm import tqdm, trange
-from torch.optim import SGD
+from torch.optim import SGD, Optimizer
 import torch.nn.functional as F
 
 from src.linearhead_trainer import LinearHeadTrainer
@@ -101,11 +101,6 @@ else:
 if is_datasets_available():
     import datasets
 
-if is_torch_tpu_available():
-    import torch_xla.core.xla_model as xm
-    import torch_xla.debug.metrics as met
-    import torch_xla.distributed.parallel_loader as pl
-
 if is_tensorboard_available():
     from transformers.integrations import TensorBoardCallback
 
@@ -113,6 +108,7 @@ if is_tensorboard_available():
 
 
 if is_wandb_available():
+    os.environ["WANDB_PROJECT"] = "LOZO"
     from transformers.integrations import WandbCallback
 
     DEFAULT_CALLBACKS.append(WandbCallback)
@@ -210,6 +206,272 @@ class Trainer(LinearHeadTrainer):
                     optimizer_grouped_parameters,
                     lr=self.args.learning_rate
                 )
+            elif self.args.optimizer == "apollo":
+                import random
+                import warnings
+                import os
+                from typing import Callable, Iterable, Tuple
+                from torch.utils.data import DataLoader
+                from copy import deepcopy
+                ADV_DEFAULT = 0xF
+
+                class GradientProjector:
+                    def __init__(
+                            self, rank: int, verbose: bool = False, update_proj_gap: int = 200,
+                            proj_type: str = "std", seed: int = 0
+                    ):
+                        self.rank = rank
+                        self.verbose = verbose
+                        self.update_proj_gap = update_proj_gap
+                        self.proj_type = proj_type
+                        self.ortho_matrix = None
+                        self.seed = seed
+                        self.svd_count = 0
+                        self.g = torch.Generator()
+
+                    def update_ortho_matrix(self, full_rank_grad: torch.Tensor, proj_type: str, ):
+                        """
+                        Updates the orthogonal matrix based on the projection type.
+
+                        Args:
+                            full_rank_grad (torch.Tensor): The full rank gradient matrix.
+                            proj_type (str): Projection type ('left', 'right').
+                        """
+                        self.ortho_matrix = self.get_orthogonal_matrix(full_rank_grad, self.rank, type=proj_type,
+                                                                       seed=self.seed)
+                        self.g.manual_seed(self.seed)
+                        self.seed = \
+                        torch.randint(0, torch.iinfo(torch.int64).max, (ADV_DEFAULT,), generator=self.g).tolist()[-1]
+
+                    def project(self, full_rank_grad: torch.Tensor, iter: int) -> torch.Tensor:
+                        """
+                        Projects the gradient to a lower rank.
+
+                        Args:
+                            full_rank_grad (torch.Tensor): The full rank gradient matrix.
+                            iter (int): Current iteration number.
+
+                        Returns:
+                            torch.Tensor: The projected low-rank gradient.
+                        """
+                        if self.proj_type == "std":
+                            if full_rank_grad.shape[0] >= full_rank_grad.shape[1]:
+                                if self.ortho_matrix is None or iter % self.update_proj_gap == 0:
+                                    self.update_ortho_matrix(full_rank_grad, proj_type="right")
+                                low_rank_grad = torch.matmul(full_rank_grad, self.ortho_matrix)
+                            else:
+                                if self.ortho_matrix is None or iter % self.update_proj_gap == 0:
+                                    self.update_ortho_matrix(full_rank_grad, proj_type="left")
+                                low_rank_grad = torch.matmul(self.ortho_matrix.t(), full_rank_grad)
+                        elif self.proj_type == "reverse_std":
+                            if full_rank_grad.shape[0] >= full_rank_grad.shape[1]:
+                                if self.ortho_matrix is None or iter % self.update_proj_gap == 0:
+                                    self.update_ortho_matrix(full_rank_grad, proj_type="left")
+                                low_rank_grad = torch.matmul(self.ortho_matrix.t(), full_rank_grad)
+                            else:
+                                if self.ortho_matrix is None or iter % self.update_proj_gap == 0:
+                                    self.update_ortho_matrix(full_rank_grad, proj_type="right")
+                                low_rank_grad = torch.matmul(full_rank_grad, self.ortho_matrix.t())
+                        elif self.proj_type == "right":
+                            if self.ortho_matrix is None or iter % self.update_proj_gap == 0:
+                                self.update_ortho_matrix(full_rank_grad, proj_type="right")
+                            low_rank_grad = torch.matmul(full_rank_grad, self.ortho_matrix.t())
+                        elif self.proj_type == "left":
+                            if self.ortho_matrix is None or iter % self.update_proj_gap == 0:
+                                self.update_ortho_matrix(full_rank_grad, proj_type="left")
+                            low_rank_grad = torch.matmul(self.ortho_matrix.t(), full_rank_grad)
+                        elif self.proj_type == "full":
+                            raise NotImplementedError("full rank projection is not implemented yet")
+
+                        return low_rank_grad
+
+                    def get_orthogonal_matrix(self, weights: torch.Tensor, rank: int, type: str,
+                                              seed: int) -> torch.Tensor:
+                        """
+                        Generates an orthogonal projection matrix.
+
+                        Args:
+                            weights (torch.Tensor): Tensor to determine the shape of the projection matrix.
+                            rank (int): Target rank for the projection.
+                            type (str): Type of projection ('left', 'right').
+                            seed (int): Seed for generating the matrix.
+
+                        Returns:
+                            torch.Tensor: The generated orthogonal matrix.
+                        """
+                        module_params = weights
+                        float_data = module_params.data.dtype == torch.float
+                        original_type = module_params.data.dtype
+                        original_device = module_params.data.device
+                        matrix = module_params.data.float() if not float_data else module_params.data
+
+                        # Generate projection matrix in a variance of sqrt(1/r)
+                        if type == "left":
+                            self.g.manual_seed(seed)
+                            proj = torch.randn((matrix.shape[0], rank), generator=self.g, device=matrix.device,
+                                               dtype=matrix.dtype) / rank ** 0.5
+                        elif type == "right":
+                            self.g.manual_seed(seed)
+                            proj = torch.randn((matrix.shape[1], rank), generator=self.g, device=matrix.device,
+                                               dtype=matrix.dtype) / rank ** 0.5
+                        elif type == "full":
+                            raise NotImplementedError("full rank projection is not implemented yet")
+                        else:
+                            raise ValueError("type should be left, right or full")
+
+                        if not float_data:
+                            proj = proj.to(original_device).type(original_type)
+                        return proj
+
+                class Apollo(Optimizer):
+                    def __init__(
+                            self,
+                            params: Iterable[nn.parameter.Parameter],
+                            lr: float = 1e-3,
+                            betas: Tuple[float, float] = (0.9, 0.999),
+                            eps: float = 1e-8,
+                            weight_decay: float = 0.0,
+                            scale_front=False,
+                    ):
+                        defaults = {"lr": lr, "betas": betas, "eps": eps, "weight_decay": weight_decay}
+                        super().__init__(params, defaults)
+                        params_idx = 0
+                        for group in self.param_groups:
+                            for p in group["params"]:
+                                params_idx += 1
+                                if p.requires_grad:
+                                    self.state[p]["seed"] = params_idx
+                        self.scale_front = scale_front
+
+                    @staticmethod
+                    def _initialize_projector(group, state):
+                        if group["proj"] == "random":
+                            return GradientProjector(
+                                group["rank"],
+                                update_proj_gap=group["update_proj_gap"],
+                                proj_type=group["proj_type"],
+                                seed=state["seed"]
+                            )
+                        else:
+                            raise ValueError("Invalid projector type specified in group")
+
+                    @torch.no_grad()
+                    def step(self, closure: Callable = None):
+                        loss = None
+                        if closure is not None:
+                            loss = closure()
+
+                        for group in self.param_groups:
+                            for p in group["params"]:
+                                if p.grad is None:
+                                    continue
+                                grad = p.grad
+
+                                state = self.state[p]
+                                if "step" not in state:
+                                    state["step"] = 0
+
+                                # APOLLO Step 1: Calculate gradient into low rank space.
+                                if "rank" in group:
+                                    norm_dim = 0 if grad.shape[0] < grad.shape[1] else 1  # low-rank dimension
+                                    if "projector" not in state:
+                                        state["projector"] = self._initialize_projector(group, state)
+                                    grad = state["projector"].project(grad, state["step"])
+
+                                # State initialization
+                                if "exp_avg" not in state:
+                                    # Exponential moving average of gradient values
+                                    state["exp_avg"] = torch.zeros_like(grad)
+                                    # Exponential moving average of squared gradient values
+                                    state["exp_avg_sq"] = torch.zeros_like(grad)
+
+                                exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
+                                beta1, beta2 = group["betas"]
+
+                                state["step"] += 1
+
+                                # APOLLO Step 2: Obtain low rank optimization states
+                                # Decay the first and second moment running average coefficient
+                                # In-place operations to update the averages at the same time
+                                exp_avg.mul_(beta1).add_(grad, alpha=(1.0 - beta1))
+                                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+                                denom = exp_avg_sq.sqrt().add_(group["eps"])
+
+                                step_size = group["lr"]
+                                bias_correction1 = 1.0 - beta1 ** state["step"]
+                                bias_correction2 = 1.0 - beta2 ** state["step"]
+                                step_size = step_size * bias_correction2 ** 0.5 / bias_correction1
+
+                                # compute norm gradient
+                                norm_grad = exp_avg / denom
+
+                                # APOLLO Step 3: Obtain approximated gradient scaling factor, channel-wise or tensor-wise.
+                                if "rank" in group:
+                                    if group['scale_type'] == 'tensor':
+                                        grad_scaling_factor = (
+                                                torch.norm(norm_grad) /
+                                                (torch.norm(grad) + 1e-8)
+                                        )
+                                    elif group['scale_type'] == 'channel':
+                                        grad_scaling_factor = (
+                                                torch.norm(norm_grad, dim=norm_dim) /
+                                                (torch.norm(grad, dim=norm_dim) + 1e-8)
+                                        )
+                                        if norm_dim == 1:
+                                            grad_scaling_factor = grad_scaling_factor.unsqueeze(1)
+
+                                    # APOLLO Step 4: Update raw gradient in original space with the approximated gradient scaling factor
+                                    scaled_grad = p.grad * grad_scaling_factor
+
+                                    if self.scale_front:
+                                        scaled_grad *= np.sqrt(group["scale"])
+
+                                    # Apply Norm-Growth Limiter in Fira (https://arxiv.org/abs/2410.01623) to avoid destructive gradient updates.
+                                    if "scaled_grad" in state:
+                                        scaled_grad_norm = torch.norm(scaled_grad)
+                                        limiter = max(
+                                            scaled_grad_norm /
+                                            (state["scaled_grad"] + 1e-8),
+                                            1.01,
+                                        ) / 1.01
+                                        scaled_grad = scaled_grad / limiter
+                                        state["scaled_grad"] = scaled_grad_norm / limiter
+                                    else:
+                                        state["scaled_grad"] = torch.norm(scaled_grad)
+
+                                    if not self.scale_front:
+                                        norm_grad = scaled_grad * (group["scale"] ** 0.5)
+
+                                p.mul_(1 - group["weight_decay"] * group["lr"])
+                                # p.add_(norm_grad, alpha=-step_size)
+                                m = ((p.grad * norm_grad) > 0).to(p.grad.dtype)
+                                p.add_((m * norm_grad) / (m.mean() + group["eps"]), alpha=-step_size)
+                        return loss
+
+                lowrank_params = []
+                for module_name, params in self.model.named_parameters():
+                    if "bias" in module_name:
+                        continue
+                    print(f"Adding {module_name} to APOLLO parameters")
+                    lowrank_params.append(params)
+
+                id_lowrank_params = [id(p) for p in lowrank_params]
+                # make parameters without "rank" to another group
+                regular_params = [p for p in self.model.parameters() if id(p) not in id_lowrank_params]
+                # then call low rank optimizer
+                param_groups = [
+                    {"params": regular_params},
+                    {
+                        "params": lowrank_params,
+                        "rank": 1,
+                        "update_proj_gap": 200,
+                        'scale_type': 'tensor',
+                        "scale": 128,
+                        "proj_type": 'std',
+                        "proj": "random",
+                    },
+                ]
+                self.optimizer = Apollo(param_groups, lr=self.args.learning_rate)
             else:
                 raise NotImplementedError
         if self.lr_scheduler is None:
@@ -462,10 +724,7 @@ class Trainer(LinearHeadTrainer):
             )
 
         # Train
-        if transformers.is_torch_tpu_available():
-            total_train_batch_size = self.args.train_batch_size * xm.xrt_world_size()
-        else:
-            total_train_batch_size = (
+        total_train_batch_size = (
                 self.args.train_batch_size
                 * self.args.gradient_accumulation_steps
                 * (torch.distributed.get_world_size() if self.args.local_rank != -1 else 1)
@@ -515,13 +774,7 @@ class Trainer(LinearHeadTrainer):
             if isinstance(train_dataloader, DataLoader) and isinstance(train_dataloader.sampler, DistributedSampler):
                 train_dataloader.sampler.set_epoch(epoch)
 
-            if transformers.is_torch_tpu_available():
-                parallel_loader = pl.ParallelLoader(train_dataloader, [self.args.device]).per_device_loader(
-                    self.args.device
-                )
-                epoch_iterator = tqdm(parallel_loader, desc="Iteration", disable=not self.is_local_process_zero())
-            else:
-                epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=True)
+            epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=True)
 
             # Reset the past mems state at the beginning of each epoch if necessary.
             if self.args.past_index >= 0:
@@ -767,9 +1020,7 @@ class Trainer(LinearHeadTrainer):
                                 if p.grad is not None:
                                     p.grad = torch.sign(p.grad)
 
-                        if transformers.is_torch_tpu_available():
-                            xm.optimizer_step(optimizer)
-                        elif self.args.fp16 and _use_native_amp:
+                        if self.args.fp16 and _use_native_amp:
                             self.scaler.step(optimizer)
                             self.scaler.update()
                         else:

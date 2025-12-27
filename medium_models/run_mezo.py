@@ -29,7 +29,7 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-
+os.environ["CUDA_VISIBLE_DEVICE"] = "3"
 @dataclass
 class ModelArguments:
     """
@@ -1123,4 +1123,6 @@ def main():
     return eval_results
 
 if __name__ == "__main__":
+    import torch.distributed as dist
+    dist.init_process_group("nccl",init_method="env://")
     main()

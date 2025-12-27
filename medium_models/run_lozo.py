@@ -1152,4 +1152,6 @@ def main():
     return eval_results
 
 if __name__ == "__main__":
+    import torch.distributed as dist
+    dist.init_process_group("nccl",init_method="env://")
     main()

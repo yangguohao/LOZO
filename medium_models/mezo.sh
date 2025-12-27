@@ -40,5 +40,5 @@ exec &> >(tee "log_dir/${TASK}-${GR_TAG}-${TAG}.log")
 
 TYPE=prompt GRID_TAG=$GR_TAG TAG=$TAG STEPS=$STEP TASK=$TASK SEED=$SEED MODEL=$MODEL K=$K \
     bash run_fewshot.sh --per_device_train_batch_size $BS --learning_rate $LR --eval_steps $EVAL_STEP --weight_decay $WD --zero_order_eps $EPS \
-    --zero_order_optim --lr_scheduler_type "constant" --optimizer "sgd" --efficient_zero_order \
+    --zero_order_optim --lr_scheduler_type "constant" --optimizer "apollo" --efficient_zero_order \
     $@
